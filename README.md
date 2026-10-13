@@ -1,3 +1,27 @@
+> **本工作区说明**
+>
+> 本仓库固定在 **v1.2.2**（detached HEAD）。本机装有两套 GTSAM —— `/usr/local` 的 4.3a1（koide3 PPA，
+> `gtsam_points 1.2.2` 依赖它）与 ROS Humble 自带的 4.2.0。ROS 的 `CMAKE_PREFIX_PATH` / `LD_LIBRARY_PATH`
+> 都排在前面会默认抢占，所以**编译和运行都必须显式指向 GTSAM 4.3**，否则分别报
+> `the type 'const boost::none_t' ... is not literal` 和 `undefined symbol: gtsam::NonlinearFactor::rekey`。
+>
+> ```bash
+> # 编译（这两个 -D 每次都要带）
+> MAKEFLAGS="-j4" colcon build --cmake-args \
+>   -DGTSAM_DIR=/usr/local/lib/cmake/GTSAM \
+>   -DGTSAM_UNSTABLE_DIR=/usr/local/lib/cmake/GTSAM_UNSTABLE
+>
+> # 运行前（每个新终端都要执行）
+> source /opt/ros/humble/setup.bash && source install/setup.bash
+> export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+>
+> # 常用命令
+> ros2 run glim_ros glim_rosbag <rosbag2目录>     # 离线建图，自动保存到 /tmp/dump
+> ros2 run glim_ros offline_viewer <dump目录>     # 查看 / 编辑地图
+> ```
+>
+> 完整步骤 —— 传感器配置、输出格式、打开旧版本 dump、排错速查 —— 见 **[quickstart.md](quickstart.md)**。
+
 ![GLIM](docs/assets/logo2.png "GLIM Logo")
 
 ## Introduction

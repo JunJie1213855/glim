@@ -128,7 +128,7 @@ ros2 run glim_ros glim_rosnode --ros-args -p dump_on_unload:=true
 # 保存到 /tmp/dump
 ```
 
-### 3.2 离线（推荐，最省事）
+### 3.2 离线（推荐）
 
 ```bash
 ros2 run glim_ros glim_rosbag <rosbag2目录>
@@ -150,10 +150,10 @@ ros2 run glim_ros glim_rosbag <rosbag2目录>
   ros2 run glim_ros glim_rosbag <bag> --ros-args -p dump_path:=/tmp/my_dump
   ```
 
-### 3.3 查看 / 编辑地图
+### 3.3 查看 / 编辑地图 （推荐，高精度定位建图后地图优化）
 
 ```bash
-ros2 run glim_ros offline_viewer <dump目录>
+ros2 run glim_ros offline_viewer <dump目录, 可选>
 ```
 
 - 直接传 dump 目录路径；不传的话启动后可在界面里选
@@ -376,6 +376,90 @@ ros2 run glim_ros offline_viewer /tmp/my_session
 | `config_logging.json` 打不开 | 旧 dump 早于该配置文件 | 无害，走默认值 |
 | `'x0' is not in this VectorValues` | dump 缺 `graph.bin`/`values.bin` | 见第 7 节；不要省略这两个文件 |
 | `unregistered class - derived class not registered` | 因子类型未导出 | 确认编译时带上了 glim 的 `export_factors.cpp` |
+
+
+### 8.1 问题一：渲染问题
+报错日志：
+```bash
+$ ros2 run glim_ros offline_viewer
+  [2026-10-13 18:39:29.745] [glim] [info] config_path: /home/ros/rosws/GLIM_ws/install/glim/share/glim/config
+  glfw error 65543: GLX: Failed to create context: GLXBadFBConfig
+  [ros2run]: Segmentation fault
+```
+
+WSL 运行 `ros2 run glim_ros offline_viewer` 出现问题，报错 glfw 无法渲染。原因:WSLg 的 D3D12 显卡路径不支持 GLFW 要的帧缓冲配置
+
+现在库的问题都解决了,程序能启动,但 GLFW 创建 OpenGL 上下文时失败:
+
+```bash
+glfw error 65543: GLX: Failed to create context: GLXBadFBConfig
+```
+
+其中：
+- WSL2 的图形是靠 WSLg + Mesa 提供的。默认走的是 d3d12 驱动(把 OpenGL 翻译成 D3D12 给 Windows),这个路径在 GLFW 请求特定 framebuffer config 时常常给不出,报 GLXBadFBConfig。
+- 我已经验证:你的 GLX 本身是好的(glxinfo 正常),而软件渲染器 llvmpipe 能用,并且支持到 OpenGL 4.5 —— 足够 GLIM 查看器用。
+
+解决办法:强制软件渲染
+
+```bash
+export LIBGL_ALWAYS_SOFTWARE=1
+ros2 run glim_ros offline_viewer
+```
+如果这样还不行,再加一个强制指定 llvmpipe:
+
+```bash
+
+export LIBGL_ALWAYS_SOFTWARE=1
+export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+ros2 run glim_ros offline_viewer
+```
+
+▎ 软件渲染性能会低一些(没有 GPU 加速),但对离线查看点云是够用的。
+
+
+### 8.2 问题二：符号问题
+报错日志：
+```bash
+$ ros2 run glim_ros offline_viewer
+  /home/ros/rosws/GLIM_ws/install/glim_ros/lib/glim_ros/offline_viewer: symbol lookup error: /usr/local/lib/libgtsam_points_cuda.so.1: undefined symbol: _ZNK5gtsam15NonlinearFactor5rekeyERKSt6vectorImSaImEE
+  [ros2run]: Process exited with failure 127
+```
+
+原因:两个 GTSAM 版本冲突(ABI 不匹配)。这次不是「找不到库」,而是加载了错误的 GTSAM 版本。关键证据:
+
+```bash
+┌──────────────────┬───────┬─────────────────────┬────────────────────────┐
+│                  │ 版本  │        位置         │ rekey(vector) 的分配器 │
+├──────────────────┼───────┼─────────────────────┼────────────────────────┤
+│ GLIM 编译时用的  │ 4.3a1 │ /usr/local/lib      │ std::allocator         │
+├──────────────────┼───────┼─────────────────────┼────────────────────────┤
+│ 运行时实际加载的 │ 4.2a9 │ /opt/ros/humble/lib │ tbb::allocator         │
+└──────────────────┴───────┴─────────────────────┴────────────────────────┘
+```
+
+其中：
+- 手动装到 `/usr/local` 的 gtsam_points 是对着 GTSAM 4.3a1 编译的,里面需要 `NonlinearFactor::rekey(std::vector<Key, std::allocator<Key>>)` 这个符号(反解出来 `...St6vectorImSaImEE,SaIm`就是 `std::allocator`)。
+- 但 ROS humble 自带 GTSAM 4.2a9,它的 rekey 用的是 `tbb::allocator`(编译时开了 TBB),符号名完全不同`(...vectorIm...tbb_allocator...)`。
+- 你当前的 `LD_LIBRARY_PATH` 里有 `/opt/ros/humble/lib/x86_64-linux-gnu` 和 `/opt/ros/humble/lib`,排在 `/usr/local/lib`(走 `ld.so.cache`)前面。运行 `ros2 run` 时链接器优先找到 humble 的 `libgtsam.so.4(4.2a9)`,而这个版本没有 `std::allocator` 版的 `rekey`,于是报:
+
+```bash
+undefined symbol: gtsam::NonlinearFactor::rekey(std::vector<... std::allocator ...> const&)
+```
+
+▎ 补充:4.2 和 4.3 的 KeyVector 默认分配器不同(一个 TBB、一个 std),这是根本性的 ABI 不兼容,不是你删改代码造成的。
+
+解决办法
+
+临时(立即能跑):运行前把 `/usr/local/lib` 提到最前面,让 GTSAM 4.3a1 被优先加载:
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+ros2 run glim_ros offline_viewer
+```
+持久化:把上面那行 `export` 加到 `~/.bashrc` 末尾。
+
+⚠️ 但要注意副作用:/opt/ros/humble 自带 gtsam 4.2a9 是给其他 ROS 包用的。如果你把 /usr/local/lib 全局前置,其他依赖 humble gtsam 的包可能反过来出问题。更稳妥的做法是给 GLIM 单独写个启动脚本(或 alias),只在跑 GLIM 时前置 /usr/local/lib。
+
 
 ---
 
